@@ -56,21 +56,23 @@ type mldState struct {
 }
 
 // SendReport implements ip.MulticastGroupProtocol.
-func (mld *mldState) SendReport(groupAddress tcpip.Address) *tcpip.Error {
+func (mld *mldState) SendReport(groupAddress tcpip.Address) (bool, *tcpip.Error) {
 	return mld.writePacket(groupAddress, groupAddress, header.ICMPv6MulticastListenerReport)
 }
 
 // SendLeave implements ip.MulticastGroupProtocol.
-func (mld *mldState) SendLeave(groupAddress tcpip.Address) *tcpip.Error {
+func (mld *mldState) SendLeave(groupAddress tcpip.Address) (bool, *tcpip.Error) {
 	return mld.writePacket(header.IPv6AllRoutersMulticastAddress, groupAddress, header.ICMPv6MulticastListenerDone)
 }
 
 // init sets up an mldState struct, and is required to be called before using
 // a new mldState.
-func (mld *mldState) init(ep *endpoint, opts MLDOptions) {
+//
+// Must only be called once for the lifetime of mld.
+func (mld *mldState) init(ep *endpoint) {
 	mld.ep = ep
-	mld.genericMulticastProtocol.Init(ip.GenericMulticastProtocolOptions{
-		Enabled:                   opts.Enabled,
+	mld.genericMulticastProtocol.Init(&ep.mu.RWMutex, ip.GenericMulticastProtocolOptions{
+		Enabled:                   ep.protocol.options.MLD.Enabled,
 		Rand:                      ep.protocol.stack.Rand(),
 		Clock:                     ep.protocol.stack.Clock(),
 		Protocol:                  mld,
@@ -79,33 +81,45 @@ func (mld *mldState) init(ep *endpoint, opts MLDOptions) {
 	})
 }
 
+// handleMulticastListenerQuery handles a query message.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) handleMulticastListenerQuery(mldHdr header.MLD) {
-	mld.genericMulticastProtocol.HandleQuery(mldHdr.MulticastAddress(), mldHdr.MaximumResponseDelay())
+	mld.genericMulticastProtocol.HandleQueryLocked(mldHdr.MulticastAddress(), mldHdr.MaximumResponseDelay())
 }
 
+// handleMulticastListenerReport handles a report message.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) handleMulticastListenerReport(mldHdr header.MLD) {
-	mld.genericMulticastProtocol.HandleReport(mldHdr.MulticastAddress())
+	mld.genericMulticastProtocol.HandleReportLocked(mldHdr.MulticastAddress())
 }
 
 // joinGroup handles joining a new group and sending and scheduling the required
 // messages.
 //
 // If the group is already joined, returns tcpip.ErrDuplicateAddress.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) joinGroup(groupAddress tcpip.Address) {
-	mld.genericMulticastProtocol.JoinGroup(groupAddress, !mld.ep.Enabled() /* dontInitialize */)
+	mld.genericMulticastProtocol.JoinGroupLocked(groupAddress, !mld.ep.Enabled() /* dontInitialize */)
 }
 
 // isInGroup returns true if the specified group has been joined locally.
+//
+// Precondition: mld.ep.mu must be read locked.
 func (mld *mldState) isInGroup(groupAddress tcpip.Address) bool {
-	return mld.genericMulticastProtocol.IsLocallyJoined(groupAddress)
+	return mld.genericMulticastProtocol.IsLocallyJoinedRLocked(groupAddress)
 }
 
 // leaveGroup handles removing the group from the membership map, cancels any
 // delay timers associated with that group, and sends the Done message, if
 // required.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) leaveGroup(groupAddress tcpip.Address) *tcpip.Error {
 	// LeaveGroup returns false only if the group was not joined.
-	if mld.genericMulticastProtocol.LeaveGroup(groupAddress) {
+	if mld.genericMulticastProtocol.LeaveGroupLocked(groupAddress) {
 		return nil
 	}
 
@@ -114,17 +128,31 @@ func (mld *mldState) leaveGroup(groupAddress tcpip.Address) *tcpip.Error {
 
 // softLeaveAll leaves all groups from the perspective of MLD, but remains
 // joined locally.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) softLeaveAll() {
-	mld.genericMulticastProtocol.MakeAllNonMember()
+	mld.genericMulticastProtocol.MakeAllNonMemberLocked()
 }
 
 // initializeAll attemps to initialize the MLD state for each group that has
 // been joined locally.
+//
+// Precondition: mld.ep.mu must be locked.
 func (mld *mldState) initializeAll() {
-	mld.genericMulticastProtocol.InitializeGroups()
+	mld.genericMulticastProtocol.InitializeGroupsLocked()
 }
 
-func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldType header.ICMPv6Type) *tcpip.Error {
+// sendQueuedReports attempts to send any reports that are queued for sending.
+//
+// Precondition: mld.ep.mu must be locked.
+func (mld *mldState) sendQueuedReports() {
+	mld.genericMulticastProtocol.SendQueuedReportsLocked()
+}
+
+// writePacket assembles and sends an IGMP packet.
+//
+// Precondition: mld.ep.mu must be locked.
+func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldType header.ICMPv6Type) (bool, *tcpip.Error) {
 	sentStats := mld.ep.protocol.stack.Stats().ICMP.V6.PacketsSent
 	var mldStat *tcpip.StatCounter
 	switch mldType {
@@ -139,9 +167,69 @@ func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldTyp
 	icmp := header.ICMPv6(buffer.NewView(header.ICMPv6HeaderSize + header.MLDMinimumSize))
 	icmp.SetType(mldType)
 	header.MLD(icmp.MessageBody()).SetMulticastAddress(groupAddress)
-	// TODO(gvisor.dev/issue/4888): We should not use the unspecified address,
-	// rather we should select an appropriate local address.
+	// As per RFC 2710 section 3,
+	//
+	//   All MLD messages described in this document are sent with a link-local
+	//   IPv6 Source Address, an IPv6 Hop Limit of 1, and an IPv6 Router Alert
+	//   option in a Hop-by-Hop Options header.
+	//
+	// However, this would cause problems with Duplicate Address Detection with
+	// the first address as MLD snooping switches may not send multicast traffic
+	// that DAD depends on to the node performing DAD without the MLD report, as
+	// documented in RFC 4816:
+	//
+	//   Note that when a node joins a multicast address, it typically sends a
+	//   Multicast Listener Discovery (MLD) report message [RFC2710] [RFC3810]
+	//   for the multicast address. In the case of Duplicate Address
+	//   Detection, the MLD report message is required in order to inform MLD-
+	//   snooping switches, rather than routers, to forward multicast packets.
+	//   In the above description, the delay for joining the multicast address
+	//   thus means delaying transmission of the corresponding MLD report
+	//   message. Since the MLD specifications do not request a random delay
+	//   to avoid race conditions, just delaying Neighbor Solicitation would
+	//   cause congestion by the MLD report messages. The congestion would
+	//   then prevent the MLD-snooping switches from working correctly and, as
+	//   a result, prevent Duplicate Address Detection from working. The
+	//   requirement to include the delay for the MLD report in this case
+	//   avoids this scenario. [RFC3590] also talks about some interaction
+	//   issues between Duplicate Address Detection and MLD, and specifies
+	//   which source address should be used for the MLD report in this case.
+	//
+	// As per RFC 3590 section 4, we should still send out MLD reports with an
+	// unspecified source address if we do not have an assigned link-local
+	// address to use as the source address to ensure DAD works as expected on
+	// networks with MLD snooping switches:
+	//
+	//   MLD Report and Done messages are sent with a link-local address as
+	//   the IPv6 source address, if a valid address is available on the
+	//   interface.  If a valid link-local address is not available (e.g., one
+	//   has not been configured), the message is sent with the unspecified
+	//   address (::) as the IPv6 source address.
+	//
+	//   Once a valid link-local address is available, a node SHOULD generate
+	//   new MLD Report messages for all multicast addresses joined on the
+	//   interface.
+	//
+	//   Routers receiving an MLD Report or Done message with the unspecified
+	//   address as the IPv6 source address MUST silently discard the packet
+	//   without taking any action on the packets contents.
+	//
+	//   Snooping switches MUST manage multicast forwarding state based on MLD
+	//   Report and Done messages sent with the unspecified address as the
+	//   IPv6 source address.
 	localAddress := header.IPv6Any
+	{
+		addressEndpoint := mld.ep.acquireOutgoingPrimaryAddressRLocked(destAddress, false /* allowExpired */)
+		if addressEndpoint != nil {
+			address := addressEndpoint.AddressWithPrefix().Address
+			addressEndpoint.DecRef()
+
+			if header.IsV6LinkLocalAddress(address) {
+				localAddress = addressEndpoint.AddressWithPrefix().Address
+			}
+		}
+	}
+
 	icmp.SetChecksum(header.ICMPv6Checksum(icmp, localAddress, destAddress, buffer.VectorisedView{}))
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
@@ -157,8 +245,8 @@ func (mld *mldState) writePacket(destAddress, groupAddress tcpip.Address, mldTyp
 	// Membership Reports.
 	if err := mld.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv6Address(destAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
 		sentStats.Dropped.Increment()
-		return err
+		return false, err
 	}
 	mldStat.Increment()
-	return nil
+	return true /* localAddress != header.IPv6Any */, nil
 }

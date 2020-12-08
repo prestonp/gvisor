@@ -16,7 +16,6 @@ package ipv4
 
 import (
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -68,8 +67,9 @@ var _ ip.MulticastGroupProtocol = (*igmpState)(nil)
 // igmpState.init() MUST be called after creating an IGMP state.
 type igmpState struct {
 	// The IPv4 endpoint this igmpState is for.
-	ep   *endpoint
-	opts IGMPOptions
+	ep *endpoint
+
+	genericMulticastProtocol ip.GenericMulticastProtocolState
 
 	// igmpV1Present is for maintaining compatibility with IGMPv1 Routers, from
 	// RFC 2236 Section 4 Page 6: "The IGMPv1 router expects Version 1
@@ -84,20 +84,14 @@ type igmpState struct {
 	// when false.
 	igmpV1Present uint32
 
-	mu struct {
-		sync.RWMutex
-
-		genericMulticastProtocol ip.GenericMulticastProtocolState
-
-		// igmpV1Job is scheduled when this interface receives an IGMPv1 style
-		// message, upon expiration the igmpV1Present flag is cleared.
-		// igmpV1Job may not be nil once igmpState is initialized.
-		igmpV1Job *tcpip.Job
-	}
+	// igmpV1Job is scheduled when this interface receives an IGMPv1 style
+	// message, upon expiration the igmpV1Present flag is cleared.
+	// igmpV1Job may not be nil once igmpState is initialized.
+	igmpV1Job *tcpip.Job
 }
 
 // SendReport implements ip.MulticastGroupProtocol.
-func (igmp *igmpState) SendReport(groupAddress tcpip.Address) *tcpip.Error {
+func (igmp *igmpState) SendReport(groupAddress tcpip.Address) (bool, *tcpip.Error) {
 	igmpType := header.IGMPv2MembershipReport
 	if igmp.v1Present() {
 		igmpType = header.IGMPv1MembershipReport
@@ -106,26 +100,25 @@ func (igmp *igmpState) SendReport(groupAddress tcpip.Address) *tcpip.Error {
 }
 
 // SendLeave implements ip.MulticastGroupProtocol.
-func (igmp *igmpState) SendLeave(groupAddress tcpip.Address) *tcpip.Error {
+func (igmp *igmpState) SendLeave(groupAddress tcpip.Address) (bool, *tcpip.Error) {
 	// As per RFC 2236 Section 6, Page 8: "If the interface state says the
 	// Querier is running IGMPv1, this action SHOULD be skipped. If the flag
 	// saying we were the last host to report is cleared, this action MAY be
 	// skipped."
 	if igmp.v1Present() {
-		return nil
+		return true, nil
 	}
 	return igmp.writePacket(header.IPv4AllRoutersGroup, groupAddress, header.IGMPLeaveGroup)
 }
 
 // init sets up an igmpState struct, and is required to be called before using
 // a new igmpState.
-func (igmp *igmpState) init(ep *endpoint, opts IGMPOptions) {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
+//
+// Must only be called once for the lifetime of igmp.
+func (igmp *igmpState) init(ep *endpoint) {
 	igmp.ep = ep
-	igmp.opts = opts
-	igmp.mu.genericMulticastProtocol.Init(ip.GenericMulticastProtocolOptions{
-		Enabled:                   opts.Enabled,
+	igmp.genericMulticastProtocol.Init(&ep.mu.RWMutex, ip.GenericMulticastProtocolOptions{
+		Enabled:                   ep.protocol.options.IGMP.Enabled,
 		Rand:                      ep.protocol.stack.Rand(),
 		Clock:                     ep.protocol.stack.Clock(),
 		Protocol:                  igmp,
@@ -133,11 +126,14 @@ func (igmp *igmpState) init(ep *endpoint, opts IGMPOptions) {
 		AllNodesAddress:           header.IPv4AllSystems,
 	})
 	igmp.igmpV1Present = igmpV1PresentDefault
-	igmp.mu.igmpV1Job = igmp.ep.protocol.stack.NewJob(&igmp.mu, func() {
+	igmp.igmpV1Job = ep.protocol.stack.NewJob(&ep.mu, func() {
 		igmp.setV1Present(false)
 	})
 }
 
+// handleIGMP handles an IGMP packet.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) handleIGMP(pkt *stack.PacketBuffer) {
 	stats := igmp.ep.protocol.stack.Stats()
 	received := stats.IGMP.PacketsReceived
@@ -207,32 +203,34 @@ func (igmp *igmpState) setV1Present(v bool) {
 	}
 }
 
+// handleMembershipQuery handles a membership query.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) handleMembershipQuery(groupAddress tcpip.Address, maxRespTime time.Duration) {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-
 	// As per RFC 2236 Section 6, Page 10: If the maximum response time is zero
 	// then change the state to note that an IGMPv1 router is present and
 	// schedule the query received Job.
-	if maxRespTime == 0 && igmp.opts.Enabled {
-		igmp.mu.igmpV1Job.Cancel()
-		igmp.mu.igmpV1Job.Schedule(v1RouterPresentTimeout)
+	if maxRespTime == 0 && igmp.ep.protocol.options.IGMP.Enabled {
+		igmp.igmpV1Job.Cancel()
+		igmp.igmpV1Job.Schedule(v1RouterPresentTimeout)
 		igmp.setV1Present(true)
 		maxRespTime = v1MaxRespTime
 	}
 
-	igmp.mu.genericMulticastProtocol.HandleQuery(groupAddress, maxRespTime)
+	igmp.genericMulticastProtocol.HandleQueryLocked(groupAddress, maxRespTime)
 }
 
+// handleMembershipReport handles a membership report.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) handleMembershipReport(groupAddress tcpip.Address) {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-	igmp.mu.genericMulticastProtocol.HandleReport(groupAddress)
+	igmp.genericMulticastProtocol.HandleReportLocked(groupAddress)
 }
 
-// writePacket assembles and sends an IGMP packet with the provided fields,
-// incrementing the provided stat counter on success.
-func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip.Address, igmpType header.IGMPType) *tcpip.Error {
+// writePacket assembles and sends an IGMP packet.
+//
+// Precondition: igmp.ep.mu must be locked.
+func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip.Address, igmpType header.IGMPType) (bool, *tcpip.Error) {
 	igmpData := header.IGMP(buffer.NewView(header.IGMPReportMinimumSize))
 	igmpData.SetType(igmpType)
 	igmpData.SetGroupAddress(groupAddress)
@@ -243,9 +241,13 @@ func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip
 		Data:               buffer.View(igmpData).ToVectorisedView(),
 	})
 
-	// TODO(gvisor.dev/issue/4888): We should not use the unspecified address,
-	// rather we should select an appropriate local address.
-	localAddr := header.IPv4Any
+	addressEndpoint := igmp.ep.mu.addressableEndpointState.AcquireOutgoingPrimaryAddress(destAddress, false /* allowExpired */)
+	if addressEndpoint == nil {
+		return false, nil
+	}
+	localAddr := addressEndpoint.AddressWithPrefix().Address
+	addressEndpoint.DecRef()
+	addressEndpoint = nil
 	igmp.ep.addIPHeader(localAddr, destAddress, pkt, stack.NetworkHeaderParams{
 		Protocol: header.IGMPProtocolNumber,
 		TTL:      header.IGMPTTL,
@@ -257,7 +259,7 @@ func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip
 	sent := igmp.ep.protocol.stack.Stats().IGMP.PacketsSent
 	if err := igmp.ep.nic.WritePacketToRemote(header.EthernetAddressFromMulticastIPv4Address(destAddress), nil /* gso */, ProtocolNumber, pkt); err != nil {
 		sent.Dropped.Increment()
-		return err
+		return false, err
 	}
 	switch igmpType {
 	case header.IGMPv1MembershipReport:
@@ -269,7 +271,7 @@ func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip
 	default:
 		panic(fmt.Sprintf("unrecognized igmp type = %d", igmpType))
 	}
-	return nil
+	return true, nil
 }
 
 // joinGroup handles adding a new group to the membership map, setting up the
@@ -278,28 +280,27 @@ func (igmp *igmpState) writePacket(destAddress tcpip.Address, groupAddress tcpip
 //
 // If the group already exists in the membership map, returns
 // tcpip.ErrDuplicateAddress.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) joinGroup(groupAddress tcpip.Address) {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-	igmp.mu.genericMulticastProtocol.JoinGroup(groupAddress, !igmp.ep.Enabled() /* dontInitialize */)
+	igmp.genericMulticastProtocol.JoinGroupLocked(groupAddress, !igmp.ep.Enabled() /* dontInitialize */)
 }
 
 // isInGroup returns true if the specified group has been joined locally.
+//
+// Precondition: igmp.ep.mu must be read locked.
 func (igmp *igmpState) isInGroup(groupAddress tcpip.Address) bool {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-	return igmp.mu.genericMulticastProtocol.IsLocallyJoined(groupAddress)
+	return igmp.genericMulticastProtocol.IsLocallyJoinedRLocked(groupAddress)
 }
 
 // leaveGroup handles removing the group from the membership map, cancels any
 // delay timers associated with that group, and sends the Leave Group message
 // if required.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) leaveGroup(groupAddress tcpip.Address) *tcpip.Error {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-
 	// LeaveGroup returns false only if the group was not joined.
-	if igmp.mu.genericMulticastProtocol.LeaveGroup(groupAddress) {
+	if igmp.genericMulticastProtocol.LeaveGroupLocked(groupAddress) {
 		return nil
 	}
 
@@ -308,16 +309,23 @@ func (igmp *igmpState) leaveGroup(groupAddress tcpip.Address) *tcpip.Error {
 
 // softLeaveAll leaves all groups from the perspective of IGMP, but remains
 // joined locally.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) softLeaveAll() {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-	igmp.mu.genericMulticastProtocol.MakeAllNonMember()
+	igmp.genericMulticastProtocol.MakeAllNonMemberLocked()
 }
 
 // initializeAll attemps to initialize the IGMP state for each group that has
 // been joined locally.
+//
+// Precondition: igmp.ep.mu must be locked.
 func (igmp *igmpState) initializeAll() {
-	igmp.mu.Lock()
-	defer igmp.mu.Unlock()
-	igmp.mu.genericMulticastProtocol.InitializeGroups()
+	igmp.genericMulticastProtocol.InitializeGroupsLocked()
+}
+
+// sendQueuedReports attempts to send any reports that are queued for sending.
+//
+// Precondition: igmp.ep.mu must be locked.
+func (igmp *igmpState) sendQueuedReports() {
+	igmp.genericMulticastProtocol.SendQueuedReportsLocked()
 }

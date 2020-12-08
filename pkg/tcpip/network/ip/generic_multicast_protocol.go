@@ -30,6 +30,21 @@ type hostState int
 // The states below are generic across IGMPv2 (RFC 2236 section 6) and MLDv1
 // (RFC 2710 section 5). Even though the states are generic across both IGMPv2
 // and MLDv1, IGMPv2 terminology will be used.
+//
+//     ___send initial report___        _____send or receive report_____
+//    |                         |      |                                |
+//    |                         V      |                                V
+//  +-------+ +-----------+ +------------+ +-------------------+ +--------+
+//  | Non-M | | Pending-M | | Delaying-M | | Queued Delaying-M | | Idle-M |
+//  +-------+ +-----------+ +------------+ +-------------------+ +--------+
+//    |          ^      |       ^      |          ^       |             ^
+//    |          |      |       |      |          |       |             |
+//     ----------        -------        ----------         -------------
+//    fail to send     send inital     fail to send       send or receive
+//   initial report      report       delayed report          report
+//
+// Not shown in the diagram above, but any state may transition into the non
+// member state when a group is left.
 const (
 	// nonMember is the "'Non-Member' state, when the host does not belong to the
 	// group on the interface. This is the initial state for all memberships on
@@ -41,12 +56,33 @@ const (
 	// but without advertising the membership to the network.
 	nonMember hostState = iota
 
+	// pendingMember is a newly joined member that is waiting to successfully send
+	// the initial set of reports.
+	//
+	// Hosts will enter this state when sending the initial report fails.
+	//
+	// This is not an RFC defined state; it is an implementation specific state to
+	// track that the initial report needs to be sent.
+	//
+	// MAY NOT transition to the idle member state from this state.
+	pendingMember
+
 	// delayingMember is the "'Delaying Member' state, when the host belongs to
 	// the group on the interface and has a report delay timer running for that
 	// membership."
 	//
 	// 'Delaying Listener' is the MLDv1 term used to describe this state.
 	delayingMember
+
+	// queuedDelayingMember is a delayingMember that failed to send a report after
+	// its delayed report timer fired. Hosts in this state are waiting to attempt
+	// retransmission of the delayed report.
+	//
+	// This is not an RFC defined state; it is an implementation specific state to
+	// track that the delayed report needs to be sent.
+	//
+	// May transition to idle member if a report is received for a group.
+	queuedDelayingMember
 
 	// idleMember is the "Idle Member" state, when the host belongs to the group
 	// on the interface and does not have a report delay timer running for that
@@ -55,6 +91,17 @@ const (
 	// 'Idle Listener' is the MLDv1 term used to describe this state.
 	idleMember
 )
+
+func (s hostState) isDelayingMember() bool {
+	switch s {
+	case nonMember, pendingMember, idleMember:
+		return false
+	case delayingMember, queuedDelayingMember:
+		return true
+	default:
+		panic(fmt.Sprintf("unrecognized host state = %d", s))
+	}
+}
 
 // multicastGroupState holds the Generic Multicast Protocol state for a
 // multicast group.
@@ -124,10 +171,16 @@ type GenericMulticastProtocolOptions struct {
 // can be represented by GenericMulticastProtocolState.
 type MulticastGroupProtocol interface {
 	// SendReport sends a multicast report for the specified group address.
-	SendReport(groupAddress tcpip.Address) *tcpip.Error
+	//
+	// Returns false if the caller should queue the report to be sent later. Note,
+	// returning false does not necessarily mean that the receiver hit an error.
+	SendReport(groupAddress tcpip.Address) (sent bool, err *tcpip.Error)
 
 	// SendLeave sends a multicast leave for the specified group address.
-	SendLeave(groupAddress tcpip.Address) *tcpip.Error
+	//
+	// Returns true if the message was successfully sent and the caller need not
+	// take any further action.
+	SendLeave(groupAddress tcpip.Address) (sent bool, err *tcpip.Error)
 }
 
 // GenericMulticastProtocolState is the per interface generic multicast protocol
@@ -138,76 +191,112 @@ type MulticastGroupProtocol interface {
 // IPv4 and IPv6. Specifically, Generic Multicast Protocol is the core state
 // machine of IGMPv2 as defined by RFC 2236 and MLDv1 as defined by RFC 2710.
 //
+// Callers must synchronize accesses to the generic multicast protocol state;
+// GenericMulticastProtocolState obtains no locks in any of its methods. The
+// only exception to this is GenericMulticastProtocolState's timer/job callbacks
+// which will obtain the lock provided to the GenericMulticastProtocolState when
+// it is initialized.
+//
 // GenericMulticastProtocolState.Init MUST be called before calling any of
 // the methods on GenericMulticastProtocolState.
 type GenericMulticastProtocolState struct {
+	// Do not allow overwriting this state.
+	_ sync.NoCopy
+
 	opts GenericMulticastProtocolOptions
 
-	mu struct {
-		sync.RWMutex
+	// memberships holds group addresses and their associated state.
+	memberships map[tcpip.Address]multicastGroupState
 
-		// memberships holds group addresses and their associated state.
-		memberships map[tcpip.Address]multicastGroupState
-	}
+	// protocolMU is the mutex used to protect the protocol.
+	protocolMU *sync.RWMutex
 }
 
 // Init initializes the Generic Multicast Protocol state.
-func (g *GenericMulticastProtocolState) Init(opts GenericMulticastProtocolOptions) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+//
+// Must only be called once for the lifetime of g.
+//
+// The GenericMulticastProtocolState will only grab the lock when timers/jobs
+// fire.
+func (g *GenericMulticastProtocolState) Init(protocolMU *sync.RWMutex, opts GenericMulticastProtocolOptions) {
+	if g.memberships != nil {
+		panic("attempted to initialize generic membership protocol state twice")
+	}
+
 	g.opts = opts
-	g.mu.memberships = make(map[tcpip.Address]multicastGroupState)
+	g.memberships = make(map[tcpip.Address]multicastGroupState)
+	g.protocolMU = protocolMU
 }
 
-// MakeAllNonMember transitions all groups to the non-member state.
+// MakeAllNonMemberLocked transitions all groups to the non-member state.
 //
 // The groups will still be considered joined locally.
-func (g *GenericMulticastProtocolState) MakeAllNonMember() {
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) MakeAllNonMemberLocked() {
 	if !g.opts.Enabled {
 		return
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for groupAddress, info := range g.mu.memberships {
+	for groupAddress, info := range g.memberships {
 		g.transitionToNonMemberLocked(groupAddress, &info)
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 	}
 }
 
-// InitializeGroups initializes each group, as if they were newly joined but
-// without affecting the groups' join count.
+// InitializeGroupsLocked initializes each group, as if they were newly joined
+// but without affecting the groups' join count.
 //
 // Must only be called after calling MakeAllNonMember as a group should not be
 // initialized while it is not in the non-member state.
-func (g *GenericMulticastProtocolState) InitializeGroups() {
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) InitializeGroupsLocked() {
 	if !g.opts.Enabled {
 		return
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for groupAddress, info := range g.mu.memberships {
+	for groupAddress, info := range g.memberships {
 		g.initializeNewMemberLocked(groupAddress, &info)
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 	}
 }
 
-// JoinGroup handles joining a new group.
+// SendQueuedReportsLocked attempts to send reports for groups that failed to
+// send reports during their last attempt.
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) SendQueuedReportsLocked() {
+	for groupAddress, info := range g.memberships {
+		switch info.state {
+		case nonMember, delayingMember, idleMember:
+		case pendingMember:
+			// pendingMembers failed to send their initial unsolicited report so try
+			// to send the report and queue the extra unsolicited reports.
+			g.maybeSendInitialReportLocked(groupAddress, &info)
+		case queuedDelayingMember:
+			// queuedDelayingMembers failed to send their delayed reports so try to
+			// send the report and transition them to the idle state.
+			g.maybeSendDelayedReportLocked(groupAddress, &info)
+		default:
+			panic(fmt.Sprintf("unrecognized host state = %d", info.state))
+		}
+		g.memberships[groupAddress] = info
+	}
+}
+
+// JoinGroupLocked handles joining a new group.
 //
 // If dontInitialize is true, the group will be not be initialized and will be
 // left in the non-member state - no packets will be sent for it until it is
 // initialized via InitializeGroups.
-func (g *GenericMulticastProtocolState) JoinGroup(groupAddress tcpip.Address, dontInitialize bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if info, ok := g.mu.memberships[groupAddress]; ok {
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) JoinGroupLocked(groupAddress tcpip.Address, dontInitialize bool) {
+	if info, ok := g.memberships[groupAddress]; ok {
 		// The group has already been joined.
 		info.joins++
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 		return
 	}
 
@@ -217,15 +306,14 @@ func (g *GenericMulticastProtocolState) JoinGroup(groupAddress tcpip.Address, do
 		// The state will be updated below, if required.
 		state:            nonMember,
 		lastToSendReport: false,
-		delayedReportJob: tcpip.NewJob(g.opts.Clock, &g.mu, func() {
-			info, ok := g.mu.memberships[groupAddress]
+		delayedReportJob: tcpip.NewJob(g.opts.Clock, g.protocolMU, func() {
+			info, ok := g.memberships[groupAddress]
 			if !ok {
 				panic(fmt.Sprintf("expected to find group state for group = %s", groupAddress))
 			}
 
-			info.lastToSendReport = g.opts.Protocol.SendReport(groupAddress) == nil
-			info.state = idleMember
-			g.mu.memberships[groupAddress] = info
+			g.maybeSendDelayedReportLocked(groupAddress, &info)
+			g.memberships[groupAddress] = info
 		}),
 	}
 
@@ -233,25 +321,24 @@ func (g *GenericMulticastProtocolState) JoinGroup(groupAddress tcpip.Address, do
 		g.initializeNewMemberLocked(groupAddress, &info)
 	}
 
-	g.mu.memberships[groupAddress] = info
+	g.memberships[groupAddress] = info
 }
 
-// IsLocallyJoined returns true if the group is locally joined.
-func (g *GenericMulticastProtocolState) IsLocallyJoined(groupAddress tcpip.Address) bool {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	_, ok := g.mu.memberships[groupAddress]
+// IsLocallyJoinedRLocked returns true if the group is locally joined.
+//
+// Precondition: g.protocolMU must be read locked.
+func (g *GenericMulticastProtocolState) IsLocallyJoinedRLocked(groupAddress tcpip.Address) bool {
+	_, ok := g.memberships[groupAddress]
 	return ok
 }
 
-// LeaveGroup handles leaving the group.
+// LeaveGroupLocked handles leaving the group.
 //
 // Returns false if the group is not currently joined.
-func (g *GenericMulticastProtocolState) LeaveGroup(groupAddress tcpip.Address) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	info, ok := g.mu.memberships[groupAddress]
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) LeaveGroupLocked(groupAddress tcpip.Address) bool {
+	info, ok := g.memberships[groupAddress]
 	if !ok {
 		return false
 	}
@@ -262,29 +349,29 @@ func (g *GenericMulticastProtocolState) LeaveGroup(groupAddress tcpip.Address) b
 	info.joins--
 	if info.joins != 0 {
 		// If we still have outstanding joins, then do nothing further.
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 		return true
 	}
 
 	g.transitionToNonMemberLocked(groupAddress, &info)
-	delete(g.mu.memberships, groupAddress)
+	delete(g.memberships, groupAddress)
 	return true
 }
 
-// HandleQuery handles a query message with the specified maximum response time.
+// HandleQueryLocked handles a query message with the specified maximum response
+// time.
 //
 // If the group address is unspecified, then reports will be scheduled for all
 // joined groups.
 //
 // Report(s) will be scheduled to be sent after a random duration between 0 and
 // the maximum response time.
-func (g *GenericMulticastProtocolState) HandleQuery(groupAddress tcpip.Address, maxResponseTime time.Duration) {
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) HandleQueryLocked(groupAddress tcpip.Address, maxResponseTime time.Duration) {
 	if !g.opts.Enabled {
 		return
 	}
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
 
 	// As per RFC 2236 section 2.4 (for IGMPv2),
 	//
@@ -299,27 +386,26 @@ func (g *GenericMulticastProtocolState) HandleQuery(groupAddress tcpip.Address, 
 	//   when sending a Multicast-Address-Specific Query.
 	if groupAddress.Unspecified() {
 		// This is a general query as the group address is unspecified.
-		for groupAddress, info := range g.mu.memberships {
+		for groupAddress, info := range g.memberships {
 			g.setDelayTimerForAddressRLocked(groupAddress, &info, maxResponseTime)
-			g.mu.memberships[groupAddress] = info
+			g.memberships[groupAddress] = info
 		}
-	} else if info, ok := g.mu.memberships[groupAddress]; ok {
+	} else if info, ok := g.memberships[groupAddress]; ok {
 		g.setDelayTimerForAddressRLocked(groupAddress, &info, maxResponseTime)
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 	}
 }
 
-// HandleReport handles a report message.
+// HandleReportLocked handles a report message.
 //
 // If the report is for a joined group, any active delayed report will be
 // cancelled and the host state for the group transitions to idle.
-func (g *GenericMulticastProtocolState) HandleReport(groupAddress tcpip.Address) {
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) HandleReportLocked(groupAddress tcpip.Address) {
 	if !g.opts.Enabled {
 		return
 	}
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
 
 	// As per RFC 2236 section 3 pages 3-4 (for IGMPv2),
 	//
@@ -333,23 +419,24 @@ func (g *GenericMulticastProtocolState) HandleReport(groupAddress tcpip.Address)
 	//   multicast address while it has a timer running for that same address
 	//   on that interface, it stops its timer and does not send a Report for
 	//   that address, thus suppressing duplicate reports on the link.
-	if info, ok := g.mu.memberships[groupAddress]; ok && info.state == delayingMember {
+	if info, ok := g.memberships[groupAddress]; ok && info.state.isDelayingMember() {
 		info.delayedReportJob.Cancel()
 		info.lastToSendReport = false
 		info.state = idleMember
-		g.mu.memberships[groupAddress] = info
+		g.memberships[groupAddress] = info
 	}
 }
 
 // initializeNewMemberLocked initializes a new group membership.
 //
-// Precondition: g.mu must be locked.
+// Precondition: g.protocolMU must be locked.
 func (g *GenericMulticastProtocolState) initializeNewMemberLocked(groupAddress tcpip.Address, info *multicastGroupState) {
 	if info.state != nonMember {
 		panic(fmt.Sprintf("state for group %s is not non-member; state = %d", groupAddress, info.state))
 	}
 
 	info.state = idleMember
+	info.lastToSendReport = false
 
 	if groupAddress == g.opts.AllNodesAddress {
 		// As per RFC 2236 section 6 page 10 (for IGMPv2),
@@ -368,6 +455,14 @@ func (g *GenericMulticastProtocolState) initializeNewMemberLocked(groupAddress t
 		return
 	}
 
+	g.maybeSendInitialReportLocked(groupAddress, info)
+}
+
+// maybeSendInitialReport attempts to start transmission of the initial set of
+// reports after newly joining a group.
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) maybeSendInitialReportLocked(groupAddress tcpip.Address, info *multicastGroupState) {
 	// As per RFC 2236 section 3 page 5 (for IGMPv2),
 	//
 	//   When a host joins a multicast group, it should immediately transmit an
@@ -385,8 +480,35 @@ func (g *GenericMulticastProtocolState) initializeNewMemberLocked(groupAddress t
 	//
 	// TODO(gvisor.dev/issue/4901): Support a configurable number of initial
 	// unsolicited reports.
-	info.lastToSendReport = g.opts.Protocol.SendReport(groupAddress) == nil
-	g.setDelayTimerForAddressRLocked(groupAddress, info, g.opts.MaxUnsolicitedReportDelay)
+	sent, err := g.opts.Protocol.SendReport(groupAddress)
+	if err == nil && sent {
+		info.lastToSendReport = true
+		g.setDelayTimerForAddressRLocked(groupAddress, info, g.opts.MaxUnsolicitedReportDelay)
+		return
+	}
+
+	info.state = pendingMember
+}
+
+// maybeSendDelayedReport attempts to send the delayed report.
+//
+// Precondition: g.protocolMU must be locked.
+func (g *GenericMulticastProtocolState) maybeSendDelayedReportLocked(groupAddress tcpip.Address, info *multicastGroupState) {
+	switch info.state {
+	case nonMember, pendingMember, idleMember:
+		panic(fmt.Sprintf("host must be in delaying member or pending delaying member state; state = %d", info.state))
+	case delayingMember, queuedDelayingMember:
+	default:
+		panic(fmt.Sprintf("unrecognized host state = %d", info.state))
+	}
+
+	sent, err := g.opts.Protocol.SendReport(groupAddress)
+	if err == nil && sent {
+		info.lastToSendReport = true
+		info.state = idleMember
+	} else {
+		info.state = queuedDelayingMember
+	}
 }
 
 // maybeSendLeave attempts to send a leave message.
@@ -459,13 +581,13 @@ func (g *GenericMulticastProtocolState) maybeSendLeave(groupAddress tcpip.Addres
 	//   we were the last node to report is cleared, this action MAY be
 	//   skipped. The Done message is sent to the link-scope all-routers
 	//   address (FF02::2).
-	_ = g.opts.Protocol.SendLeave(groupAddress)
+	_, _ = g.opts.Protocol.SendLeave(groupAddress)
 }
 
 // transitionToNonMemberLocked transitions the given multicast group the the
 // non-member/listener state.
 //
-// Precondition: e.mu must be locked.
+// Precondition: g.protocolMU must be locked.
 func (g *GenericMulticastProtocolState) transitionToNonMemberLocked(groupAddress tcpip.Address, info *multicastGroupState) {
 	if info.state == nonMember {
 		return
@@ -479,7 +601,7 @@ func (g *GenericMulticastProtocolState) transitionToNonMemberLocked(groupAddress
 
 // setDelayTimerForAddressRLocked sets timer to send a delay report.
 //
-// Precondition: g.mu MUST be read locked.
+// Precondition: g.protocolMU MUST be read locked.
 func (g *GenericMulticastProtocolState) setDelayTimerForAddressRLocked(groupAddress tcpip.Address, info *multicastGroupState, maxResponseTime time.Duration) {
 	if info.state == nonMember {
 		return
@@ -499,6 +621,7 @@ func (g *GenericMulticastProtocolState) setDelayTimerForAddressRLocked(groupAddr
 		//   case. The node starts in Idle Listener state for that address on
 		//   every interface, never transitions to another state, and never sends
 		//   a Report or Done for that address.
+		info.state = idleMember
 		return
 	}
 

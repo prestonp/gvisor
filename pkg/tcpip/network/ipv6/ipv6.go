@@ -85,9 +85,8 @@ type endpoint struct {
 
 		addressableEndpointState stack.AddressableEndpointState
 		ndp                      ndpState
+		mld                      mldState
 	}
-
-	mld mldState
 }
 
 // NICNameFromID is a function that returns a stable name for the specified NIC,
@@ -120,6 +119,55 @@ type OpaqueInterfaceIdentifierOptions struct {
 	// May be nil, but a nil value is highly discouraged to maintain
 	// some level of randomness between nodes.
 	SecretKey []byte
+}
+
+// onDADCompletedLocked is a handler for when DAD completes for an address.
+//
+// Precondition: e.mu must be exclusively locked.
+func (e *endpoint) onDADCompletedLocked(addressEndpoint stack.AddressEndpoint) {
+	addr := addressEndpoint.AddressWithPrefix()
+
+	// If DAD resolved for a stable SLAAC address, attempt generation of a
+	// temporary SLAAC address.
+	if addressEndpoint.ConfigType() == stack.AddressConfigSlaac {
+		// Reset the generation attempts counter as we are starting the generation
+		// of a new address for the SLAAC prefix.
+		e.mu.ndp.regenerateTempSLAACAddr(addr.Subnet(), true /* resetGenAttempts */)
+	}
+
+	// As per RFC 2710 section 3,
+	//
+	//   All MLD  messages described in this document are sent with a link-local
+	//   IPv6 Source Address, ...
+	//
+	// If we just completed DAD for a link-local address, then attempt to send any
+	// queued MLD reports. Note, we may have sent reports already for some of the
+	// groups before we had a valid link-local address to use as the source for
+	// the MLD messages, but that was only so that MLD snooping switches are aware
+	// of our membership to groups - routers would not have handled those reports.
+	//
+	// As per RFC 3590 section 4,
+	//
+	//   MLD Report and Done messages are sent with a link-local address as
+	//   the IPv6 source address, if a valid address is available on the
+	//   interface. If a valid link-local address is not available (e.g., one
+	//   has not been configured), the message is sent with the unspecified
+	//   address (::) as the IPv6 source address.
+	//
+	//   Once a valid link-local address is available, a node SHOULD generate
+	//   new MLD Report messages for all multicast addresses joined on the
+	//   interface.
+	//
+	//   Routers receiving an MLD Report or Done message with the unspecified
+	//   address as the IPv6 source address MUST silently discard the packet
+	//   without taking any action on the packets contents.
+	//
+	//   Snooping switches MUST manage multicast forwarding state based on MLD
+	//   Report and Done messages sent with the unspecified address as the
+	//   IPv6 source address.
+	if header.IsV6LinkLocalAddress(addr.Address) {
+		e.mu.mld.sendQueuedReports()
+	}
 }
 
 // InvalidateDefaultRouter implements stack.NDPEndpoint.
@@ -232,7 +280,7 @@ func (e *endpoint) Enable() *tcpip.Error {
 	// endpoint may have left groups from the perspective of MLD when the
 	// endpoint was disabled. Either way, we need to let routers know to
 	// send us multicast traffic.
-	e.mld.initializeAll()
+	e.mu.mld.initializeAll()
 
 	// Join the IPv6 All-Nodes Multicast group if the stack is configured to
 	// use IPv6. This is required to ensure that this node properly receives
@@ -334,7 +382,7 @@ func (e *endpoint) Disable() {
 }
 
 func (e *endpoint) disableLocked() {
-	if !e.setEnabled(false) {
+	if !e.Enabled() {
 		return
 	}
 
@@ -349,7 +397,11 @@ func (e *endpoint) disableLocked() {
 
 	// Leave groups from the perspective of MLD so that routers know that
 	// we are no longer interested in the group.
-	e.mld.softLeaveAll()
+	e.mu.mld.softLeaveAll()
+
+	if !e.setEnabled(false) {
+		panic("should have only done work to disable the endpoint if it was enabled")
+	}
 }
 
 // stopDADForPermanentAddressesLocked stops DAD for all permaneent addresses.
@@ -1417,7 +1469,7 @@ func (e *endpoint) joinGroupLocked(addr tcpip.Address) *tcpip.Error {
 		return tcpip.ErrBadAddress
 	}
 
-	e.mld.joinGroup(addr)
+	e.mu.mld.joinGroup(addr)
 	return nil
 }
 
@@ -1432,14 +1484,14 @@ func (e *endpoint) LeaveGroup(addr tcpip.Address) *tcpip.Error {
 //
 // Precondition: e.mu must be locked.
 func (e *endpoint) leaveGroupLocked(addr tcpip.Address) *tcpip.Error {
-	return e.mld.leaveGroup(addr)
+	return e.mu.mld.leaveGroup(addr)
 }
 
 // IsInGroup implements stack.GroupAddressableEndpoint.
 func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.mld.isInGroup(addr)
+	return e.mu.mld.isInGroup(addr)
 }
 
 var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
@@ -1504,17 +1556,11 @@ func (p *protocol) NewEndpoint(nic stack.NetworkInterface, linkAddrCache stack.L
 		dispatcher:    dispatcher,
 		protocol:      p,
 	}
+	e.mu.Lock()
 	e.mu.addressableEndpointState.Init(e)
-	e.mu.ndp = ndpState{
-		ep:             e,
-		configs:        p.options.NDPConfigs,
-		dad:            make(map[tcpip.Address]dadState),
-		defaultRouters: make(map[tcpip.Address]defaultRouterState),
-		onLinkPrefixes: make(map[tcpip.Subnet]onLinkPrefixState),
-		slaacPrefixes:  make(map[tcpip.Subnet]slaacPrefixState),
-	}
-	e.mu.ndp.initializeTempAddrState()
-	e.mld.init(e, p.options.MLD)
+	e.mu.ndp.init(e)
+	e.mu.mld.init(e)
+	e.mu.Unlock()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
